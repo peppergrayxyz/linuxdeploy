@@ -1,9 +1,12 @@
 // system headers
+#include <algorithm>
 #include <assert.h>
+#include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <memory>
 #include <regex>
+#include <sstream>
 #include <sys/mman.h>
 #include <utility>
 
@@ -12,6 +15,11 @@
 #include "linuxdeploy/log/log.h"
 #include "linuxdeploy/util/util.h"
 #include "linuxdeploy/subprocess/subprocess.h"
+
+// older C libraries' headers lack this flag
+#ifndef DF_1_PIE
+#define DF_1_PIE 0x08000000
+#endif
 
 using namespace linuxdeploy::log;
 
@@ -25,8 +33,10 @@ namespace linuxdeploy {
                     const fs::path path;
                     uint8_t elfClass = ELFCLASSNONE;
                     uint8_t elfABI = 0;
+                    uint16_t elfMachine = EM_NONE;
                     bool isDebugSymbolsFile = false;
                     bool isDynamicallyLinked = false;
+                    fs::path interpreter;
 
                 public:
                     explicit PrivateData(fs::path path) : path(std::move(path)) {}
@@ -74,8 +84,8 @@ namespace linuxdeploy {
                     }
 
                 private:
-                    template<typename Ehdr_T, typename Shdr_T, typename Phdr_T>
-                    void parseElfHeader(std::shared_ptr<uint8_t> data) {
+                    template<typename Ehdr_T, typename Shdr_T, typename Phdr_T, typename Dyn_T>
+                    void parseElfHeader(std::shared_ptr<uint8_t> data, size_t dataSize) {
                         // TODO: the following code will _only_ work if the native byte order equals the program's
                         // this should not be a big problem as we don't offer ARM builds yet, and require the user to
                         // use a matching binary for the target binaries
@@ -83,6 +93,7 @@ namespace linuxdeploy {
                         auto* ehdr = reinterpret_cast<Ehdr_T*>(data.get());
 
                         elfABI = ehdr->e_ident[EI_OSABI];
+                        elfMachine = ehdr->e_machine;
 
                         std::vector<Shdr_T> sections;
 
@@ -112,15 +123,109 @@ namespace linuxdeploy {
                         isDebugSymbolsFile = (sectionsMap[".text"].sh_type == SHT_NOBITS);
 
                         // https://stackoverflow.com/a/7298931
-                        for (uint64_t i = 0; i < ehdr->e_phnum && !isDynamicallyLinked; ++i) {
+                        const Phdr_T* dynamicPhdr = nullptr;
+                        for (uint64_t i = 0; i < ehdr->e_phnum; ++i) {
                             auto* nextPhdr = reinterpret_cast<Phdr_T*>(data.get() + ehdr->e_phoff + i * sizeof(Phdr_T));
                             switch (nextPhdr->p_type) {
-                                case PT_DYNAMIC:
                                 case PT_INTERP:
+                                    // debug symbols files retain PT_INTERP, but its contents are stripped, so it may
+                                    // point to unrelated data or beyond the end of the file
+                                    if (nextPhdr->p_filesz > 0 && nextPhdr->p_offset < dataSize) {
+                                        const auto* interp = reinterpret_cast<const char*>(data.get() + nextPhdr->p_offset);
+                                        const auto maxSize = std::min<uint64_t>(nextPhdr->p_filesz, dataSize - nextPhdr->p_offset);
+                                        interpreter = std::string{interp, strnlen(interp, maxSize)};
+                                    }
                                     isDynamicallyLinked = true;
+                                    break;
+                                case PT_DYNAMIC:
+                                    dynamicPhdr = nextPhdr;
                                     break;
                             }
                         }
+
+                        // shared libraries have no PT_INTERP, but a PT_DYNAMIC segment
+                        // static-pie executables (e.g., the default for Rust's musl targets) look the same, but need no
+                        // other libraries, and are marked as PIE by the linker, which shared libraries never are
+                        if (!isDynamicallyLinked && dynamicPhdr != nullptr)
+                            isDynamicallyLinked = isDebugSymbolsFile || !isStaticPie<Dyn_T>(data, dataSize, dynamicPhdr);
+                    }
+
+                    // the caller must make sure the file has no PT_INTERP
+                    // not suitable for debug symbols files, whose dynamic section has been stripped, so the segment
+                    // points to unrelated data or beyond the end of the file
+                    template<typename Dyn_T, typename Phdr_T>
+                    static bool isStaticPie(const std::shared_ptr<uint8_t>& data, size_t dataSize, const Phdr_T* dynamicPhdr) {
+                        if (dynamicPhdr->p_offset >= dataSize)
+                            return false;
+
+                        bool isPie = false;
+
+                        const auto dynamicSize = std::min<uint64_t>(dynamicPhdr->p_filesz, dataSize - dynamicPhdr->p_offset);
+                        const auto dynamicEntries = dynamicSize / sizeof(Dyn_T);
+                        for (uint64_t i = 0; i < dynamicEntries; ++i) {
+                            auto* dyn = reinterpret_cast<Dyn_T*>(data.get() + dynamicPhdr->p_offset + i * sizeof(Dyn_T));
+
+                            if (dyn->d_tag == DT_NULL)
+                                break;
+
+                            // a PIE which needs other libraries but has no PT_INTERP (e.g., linked with
+                            // --no-dynamic-linker) must still be traced
+                            if (dyn->d_tag == DT_NEEDED)
+                                return false;
+
+                            if (dyn->d_tag == DT_FLAGS_1 && (dyn->d_un.d_val & DF_1_PIE) != 0)
+                                isPie = true;
+                        }
+
+                        return isPie;
+                    }
+
+                    // multilib systems can have loaders for several architectures installed
+                    bool isLoaderForThisFile(const fs::path& loader) const {
+                        std::ifstream ifs(loader.string(), std::ios::binary);
+                        unsigned char header[EI_NIDENT + 4]{};
+                        if (!ifs.read(reinterpret_cast<char*>(header), sizeof(header)))
+                            return false;
+
+                        // e_machine directly follows e_type, and both have the same offset in 32-bit and 64-bit files
+                        uint16_t machine;
+                        std::memcpy(&machine, header + EI_NIDENT + 2, sizeof(machine));
+
+                        return std::memcmp(header, ELFMAG, SELFMAG) == 0 && header[EI_CLASS] == elfClass && machine == elfMachine;
+                    }
+
+                public:
+                    // find a dynamic loader which can list the dependencies like ldd does
+                    // used as a fallback on systems which do not ship ldd (e.g., Alpine without musl-utils)
+                    fs::path findLoader() const {
+                        // executables tell us which loader to use
+                        // the loader will be executed, so only trust loaders installed to the system's library
+                        // directories rather than any path an ELF file references
+                        static const std::vector<fs::path> systemLoaderDirs{
+                            "/lib", "/lib32", "/lib64", "/libx32", "/libexec", "/usr/lib", "/usr/lib32", "/usr/lib64",
+                        };
+
+                        std::error_code ec;
+                        if (!interpreter.empty() && fs::exists(interpreter, ec)
+                            && std::find(systemLoaderDirs.begin(), systemLoaderDirs.end(), interpreter.parent_path()) != systemLoaderDirs.end()
+                            && isLoaderForThisFile(interpreter))
+                            return interpreter;
+
+                        // shared libraries do not reference a loader, but musl's loader is installed to a fixed location
+                        // glibc systems always ship ldd, so there is no need to look for glibc's loader
+                        std::vector<fs::path> muslLoaders;
+                        for (fs::directory_iterator it("/lib", ec), end; !ec && it != end; it.increment(ec)) {
+                            const auto fileName = it->path().filename().string();
+                            if (util::stringStartsWith(fileName, "ld-musl-") && util::stringEndsWith(fileName, ".so.1")
+                                && isLoaderForThisFile(it->path()))
+                                muslLoaders.emplace_back(it->path());
+                        }
+
+                        // with multiple matching loaders installed (e.g., arm and armhf), we cannot tell which one is the right one
+                        if (muslLoaders.size() == 1)
+                            return muslLoaders.front();
+
+                        return {};
                     }
 
                 public:
@@ -148,10 +253,10 @@ namespace linuxdeploy {
 
                         switch (elfClass) {
                             case ELFCLASS32:
-                                parseElfHeader<Elf32_Ehdr, Elf32_Shdr, Elf32_Phdr>(data);
+                                parseElfHeader<Elf32_Ehdr, Elf32_Shdr, Elf32_Phdr, Elf32_Dyn>(data, map_size);
                                 break;
                             case ELFCLASS64:
-                                parseElfHeader<Elf64_Ehdr, Elf64_Shdr, Elf64_Phdr>(data);
+                                parseElfHeader<Elf64_Ehdr, Elf64_Shdr, Elf64_Phdr, Elf64_Dyn>(data, map_size);
                                 break;
                             default:
                                 throw ElfFileParseError("Unknown ELF class: " + std::to_string(elfClass));
@@ -189,8 +294,9 @@ namespace linuxdeploy {
 
                 // for now, we use the same ldd based method linuxdeployqt uses
 
-                // of course, it makes no sense to call this method on statically linked binaries
-                assert(isDynamicallyLinked());
+                // Static ELF files have no dynamic dependencies and need no loader probe.
+                if (!isDynamicallyLinked())
+                    return {};
 
                 std::vector<fs::path> paths;
 
@@ -203,7 +309,36 @@ namespace linuxdeploy {
                 // note that this is just a bug in ldd, the linker has always worked as intended
                 const auto resolvedPath = fs::canonical(d->path);
 
-                subprocess::subprocess lddProc({"ldd", resolvedPath.string()}, env);
+                std::vector<std::string> lddCommand{"ldd", resolvedPath.string()};
+
+                if (util::which("ldd").empty()) {
+                    const auto loader = d->findLoader();
+
+                    if (loader.empty())
+                        throw DependencyTraceError("Could not find ldd or a dynamic loader to trace dependencies of " + resolvedPath.string());
+
+                    // both loaders produce ldd compatible output, but must be asked differently
+                    // calling a loader which ignores these would run the program, therefore only known ones are used
+                    const auto loaderName = loader.filename().string();
+                    if (util::stringStartsWith(loaderName, "ld-musl-")) {
+                        // musl does not support LD_TRACE_LOADED_OBJECTS
+                        lddCommand = {loader.string(), "--list", resolvedPath.string()};
+                    } else if (util::stringStartsWith(loaderName, "ld-linux") || util::stringStartsWith(loaderName, "ld64.so")
+                               || util::stringStartsWith(loaderName, "ld.so") || util::stringStartsWith(loaderName, "ld-elf")) {
+                        // glibc's --list stops at the first missing library, while this mode (used by glibc's ldd)
+                        // reports all of them
+                        // FreeBSD's ld-elf.so.1 supports the same variable
+                        env["LD_TRACE_LOADED_OBJECTS"] = "1";
+                        lddCommand = {loader.string(), resolvedPath.string()};
+                    } else {
+                        throw DependencyTraceError("Could not find ldd, and unknown dynamic loader " + loader.string() +
+                                                   " cannot be used to trace dependencies of " + resolvedPath.string());
+                    }
+
+                    ldLog() << LD_WARNING << "Could not find ldd in $PATH, using dynamic loader" << loader << "instead" << std::endl;
+                }
+
+                subprocess::subprocess lddProc(lddCommand, env);
 
                 const auto result = lddProc.run();
 
@@ -213,12 +348,84 @@ namespace linuxdeploy {
                         return {};
                     }
 
-                    throw std::runtime_error{"Failed to run ldd: exited with code " + std::to_string(result.exit_code())};
+                    // musl reports missing DT_NEEDED libraries on stderr and
+                    // returns a non-zero status, while still printing the
+                    // dependencies it could resolve on stdout.
+                    //
+                    // Accept excluded missing libraries and relocation errors,
+                    // but reject all other failures. musl also checks symbols
+                    // in this mode (unlike glibc's ldd without -r), which fails
+                    // for plugins whose symbols are provided by the host program.
+                    // other load errors (e.g., a library for another architecture) are no missing libraries, and must
+                    // not be accepted by excluding the library
+                    static const std::regex muslMissingLibraryExpr(
+                        R"(^Error loading shared library ([^:]+): No such file or directory(?: \(needed by .+\))?$)");
+                    static const std::regex muslMissingSymbolExpr(
+                        R"(^Error relocating .+: .+: symbol not found$)");
+
+                    bool sawExcludedMissingLibrary = false;
+                    bool sawMissingSymbolExpr = false;
+                    bool sawUnexpectedError = false;
+
+                    for (auto& line : util::splitLines(result.stderr_string())) {
+                        util::trim(line);
+
+                        if (line.empty())
+                            continue;
+
+                        std::smatch match;
+                        if (std::regex_match(line, match, muslMissingLibraryExpr)) {
+                            auto missingLibrary = match[1].str();
+                            util::trim(missingLibrary);
+
+                            if (!util::isInExcludelist(missingLibrary, excludeLibraryPatterns)) {
+                                throw DependencyNotFoundError("Could not find dependency: " + missingLibrary);
+                            }
+
+                            sawExcludedMissingLibrary = true;
+                            ldLog() << LD_WARNING
+                                    << resolvedPath.string()
+                                    << "depends on excluded library:"
+                                    << missingLibrary << std::endl;
+
+                            continue;
+                        }
+
+                        if (std::regex_match(line, muslMissingSymbolExpr)) {
+                            sawMissingSymbolExpr = true;
+                        } else {
+                            sawUnexpectedError = true;
+                        }
+                    }
+
+                    // A nonzero exit without a known diagnostic is still a
+                    // failure, even if stderr is empty. Check after scanning
+                    // so diagnostic order does not affect the result.
+                    if (sawUnexpectedError || (!sawExcludedMissingLibrary && !sawMissingSymbolExpr)) {
+                        std::ostringstream message;
+                        message << "Failed to run ldd on " << resolvedPath.string()
+                                << ": exited with code " << result.exit_code();
+                        if (!result.stdout_string().empty())
+                            message << "\nstdout:\n" << result.stdout_string();
+                        if (!result.stderr_string().empty())
+                            message << "\nstderr:\n" << result.stderr_string();
+                        throw DependencyTraceError(message.str());
+                    }
+
+                    // all libraries were found, so the dependency list is complete, but the program may still fail
+                    // at runtime if the symbols are not provided by someone else
+                    if (sawMissingSymbolExpr) {
+                        ldLog() << LD_WARNING << resolvedPath.string() << LD_NO_SPACE
+                                << ": ignoring unresolved symbols, they must be provided at runtime (e.g., by an excluded "
+                                   "library or the program loading this file):" << std::endl
+                                << result.stderr_string();
+                    }
                 }
 
-                const std::regex expr(R"(\s*(.+)\s+\=>\s+(.+)\s+\((.+)\)\s*)");
-                std::smatch what;
-
+                // FreeBSD appends an address to missing libraries, so check these
+                // records before the expression for successfully resolved paths.
+                static const std::regex missingLibraryExpr(R"(\s*(.+)\s+=>\s+not found(?:\s+\([^)]+\))?\s*)");
+                static const std::regex expr(R"(\s*(.+)\s+\=>\s+(.+)\s+\((.+)\)\s*)");
                 auto lddLines = util::splitLines(result.stdout_string());
 
                 // filter known-problematic, known-unneeded lines
@@ -235,25 +442,47 @@ namespace linuxdeploy {
                     lddLines.end()
                 );
 
+                // These names are aliases for musl's combined libc/dynamic loader.
+                static const std::regex muslLibcExpr(R"(lib(c|c_musl|crypt|pthread|resolv|rt|m|dl|util|xnet)\..+)");
+
+                std::smatch what;
                 for (const auto& line : lddLines) {
+                    if (std::regex_match(line, what, missingLibraryExpr)) {
+                        auto missingLib = what[1].str();
+                        util::trim(missingLib);
+                        util::trim(missingLib, '\t');
+                        if (!util::isInExcludelist(missingLib, excludeLibraryPatterns)) {
+                            throw DependencyNotFoundError("Could not find dependency: " + missingLib);
+                        }
+                        ldLog() << LD_WARNING << resolvedPath.string() << "depends on excluded library:" << missingLib << std::endl;
+                        continue;
+                    }
+
                     if (std::regex_search(line, what, expr)) {
+                        auto libraryName = what[1].str();
+                        util::trim(libraryName);
                         auto libraryPath = what[2].str();
                         util::trim(libraryPath);
+
+                        const auto fileName = fs::path(libraryPath).filename().string();
+                        const bool muslLoader = util::stringStartsWith(fileName, "ld-musl-")
+                                                && util::stringEndsWith(fileName, ".so.1");
+                        // When a shared object has no PT_INTERP, musl can identify
+                        // itself as argv[0] ("ldd") or by its libc.so filename.
+                        // Neither is an ordinary library to copy into the AppDir.
+                        const bool muslSelfReference = (fileName == "ldd"
+                                                        || fileName == "libc.so"
+                                                        || fileName == "libc_musl.so")
+                                                       && std::regex_match(libraryName, muslLibcExpr);
+
+                        if (muslLoader || muslSelfReference) {
+                            ldLog() << LD_DEBUG << "skipping musl runtime object" << line << std::endl;
+                            continue;
+                        }
+
                         paths.push_back(fs::absolute(libraryPath));
                     } else {
-                        if (util::stringContains(line, "=> not found")) {
-                            auto missingLib = line;
-                            static const std::string pattern = "=> not found";
-                            missingLib.erase(missingLib.find(pattern), pattern.size());
-                            util::trim(missingLib);
-                            util::trim(missingLib, '\t');
-                            if (!util::isInExcludelist(missingLib, excludeLibraryPatterns)) {
-                                throw DependencyNotFoundError("Could not find dependency: " + missingLib);
-                            }
-                            ldLog() << LD_WARNING << resolvedPath.string() << "depends on excluded library:" << missingLib << std::endl;
-                        } else {
-                            ldLog() << LD_DEBUG << "Invalid ldd output: " << line << std::endl;
-                        }
+                        ldLog() << LD_DEBUG << "Invalid ldd output: " << line << std::endl;
                     }
                 }
 

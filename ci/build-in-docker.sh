@@ -18,13 +18,56 @@ error() {
     log_message 1 "[error] $*"
 }
 
-if [[ "$ARCH" == "" ]]; then
-    error "Usage: env ARCH=... bash $0"
-    exit 2
-fi
 set -euo pipefail
 
+export ARCH="${ARCH:-$(uname -m)}"
+
 this_dir="$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")"
+
+target="${1:-${TARGET:-debian}}"
+toolchain="${TOOLCHAIN:-}"
+build_args=()
+login_shell=
+
+case "$target" in
+    debian)
+        if [[ -n "$toolchain" ]]; then
+            error "TOOLCHAIN is not supported for Debian builds"
+            exit 2
+        fi
+        dockerfile="$this_dir/docker/Dockerfile"
+        build_args+=("--build-arg" "ARCH=$ARCH")
+        ;;
+    alpine)
+        dockerfile="$this_dir/docker/Dockerfile.Alpine"
+        toolchain="${toolchain:-musl}"
+        case "$toolchain" in
+            musl|llvm) build_args+=("--target" "$toolchain") ;;
+            *) error "Unsupported Alpine toolchain: $toolchain"
+               exit 2
+            ;;
+        esac
+        ;;
+    gentoo)
+        toolchain="${toolchain:-llvm}"
+        case "$toolchain" in
+            gnu)  gentoo_flavor=latest ;;
+            musl) gentoo_flavor=musl ;;
+            llvm) gentoo_flavor=musl-llvm ;;
+            *) error "Unsupported Gentoo toolchain: $toolchain"
+               exit 2
+            ;;
+        esac
+        build_args+=("--build-arg" "GENTOO_FLAVOR=$gentoo_flavor")
+        dockerfile="$this_dir/docker/Dockerfile.Gentoo"
+        # Gentoo sets up the toolchain environment in /etc/profile.env
+        login_shell=1
+        ;;
+    *)
+        error "Unsupported target: $target"
+        exit 2
+        ;;
+esac
 
 case "$ARCH" in
     x86_64)
@@ -48,19 +91,20 @@ esac
 # first, we need to build the image
 # we always attempt to build it, it will only be rebuilt if Docker detects changes
 # optionally, we'll pull the base image beforehand
-info "Building Docker image for $ARCH (Docker platform: $docker_platform)"
-
-build_args=()
+info "Building $target Docker image for $ARCH (Docker platform: $docker_platform)"
 if [[ "${UPDATE:-}" == "" ]]; then
     warning "\$UPDATE not set, base image will not be pulled!"
 else
     build_args+=("--pull")
 fi
 
-image_tag="linuxdeploy-build"
+image_tag="linuxdeploy-build-$target"
+if [[ -n "$toolchain" ]]; then
+    image_tag+="-$toolchain"
+fi
 
 docker build \
-    --build-arg ARCH="$ARCH" \
+    -f "$dockerfile" \
     --platform "$docker_platform" \
     "${build_args[@]}" \
     -t "$image_tag" \
@@ -80,11 +124,11 @@ else
     warning "Host system does not have enough free memory -> building on regular disk"
 fi
 
-if [[ "${BUILD_TYPE:-}" == "coverage" ]]; then
-    build_script="ci/test-coverage.sh"
-else
-    build_script="ci/build.sh"
-fi
+case "${BUILD_TYPE:-}" in
+    coverage)           build_script="ci/test-coverage.sh"  ;;
+    dependency-tracing) build_script="ci/test-dependency-tracing.sh" ;;
+    *)                  build_script="ci/build.sh" ;;
+esac
 
 
 if [ -t 1 ]; then
@@ -105,6 +149,14 @@ fi
 #   a) make sure root is not required for builds
 #   b) allow the build scripts to "mv" the binaries into the /out directory
 uid="${UID:-"$(id -u)"}"
+
+# other distributions' /etc/profile would reset the $PATH set up by their Dockerfiles
+bash_args=(-xc)
+if [[ -n "$login_shell" ]]; then
+    # no tracing in login shells, it would print every line of /etc/profile
+    bash_args=(--login -c)
+fi
+
 info "Running build with uid $uid"
 docker run \
     --rm \
@@ -118,4 +170,4 @@ docker run \
     -v "$(readlink -f "$this_dir"/..):/ws" \
     -w /ws \
     "$image_tag" \
-    bash -xc "$build_script"
+    bash "${bash_args[@]}" "$build_script"

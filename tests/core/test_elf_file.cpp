@@ -49,6 +49,24 @@ namespace LinuxDeployTest {
 
         ElfFile staticLibraryFile(SIMPLE_EXECUTABLE_STATIC_PATH);
         EXPECT_FALSE(staticLibraryFile.isDynamicallyLinked());
+
+        // shared libraries have no program interpreter, but they need other libraries
+        ElfFile sharedLibraryFile(SIMPLE_LIBRARY_PATH);
+        EXPECT_TRUE(sharedLibraryFile.isDynamicallyLinked());
+
+        // like static-pie executables, this library has neither a program interpreter nor needs other libraries,
+        // but it is no PIE
+        ElfFile noDependenciesLibraryFile(SIMPLE_LIBRARY_NO_DEPENDENCIES_PATH);
+        EXPECT_TRUE(noDependenciesLibraryFile.isDynamicallyLinked());
+    }
+
+    TEST_F(ElfFileTest, checkIsDynamicallyLinkedStaticPie) {
+#ifdef SIMPLE_EXECUTABLE_STATIC_PIE_PATH
+        ElfFile staticPieFile(SIMPLE_EXECUTABLE_STATIC_PIE_PATH);
+        EXPECT_FALSE(staticPieFile.isDynamicallyLinked());
+#else
+        GTEST_SKIP() << "toolchain cannot link static-pie executables";
+#endif
     }
 
     TEST_F(ElfFileTest, checkInvalidElfHeaderOnEmptyFile) {

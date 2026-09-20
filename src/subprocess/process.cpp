@@ -1,5 +1,7 @@
 // system headers
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <unistd.h>
@@ -121,31 +123,54 @@ process::process(const std::vector<std::string>& args, const subprocess_env_map_
     create_pipe(stdout_pipe_fds);
     create_pipe(stderr_pipe_fds);
 
+    // prepare arguments for exec*
+    // this must happen before forking, as the child may not allocate memory (see below)
+    auto exec_args = make_args_vector(args);
+    auto exec_env = env_map_to_vector(env);
+
+    auto free_exec_vectors = [&exec_args, &exec_env]() {
+        std::for_each(exec_args.begin(), exec_args.end(), free);
+        std::for_each(exec_env.begin(), exec_env.end(), free);
+    };
+
     // create child process
     child_pid_ = fork();
 
     if (child_pid_ < 0) {
+        free_exec_vectors();
         throw std::runtime_error{"fork() failed"};
     }
 
     if (child_pid_ == 0) {
         // we're in the child process
 
+        // the parent may be multithreaded, so only async-signal-safe functions may be called until exec*
+        // in particular, no memory may be allocated, and no exceptions may be thrown: they would unwind the forked copy
+        // of the caller, which would then continue to run the caller's code
+        // instead, report errors on the child's stderr and exit with the status shells use for missing commands
+        // strerror() is not strictly async-signal-safe either, but makes for useful error messages
+        auto fail = [](const char* message, int error) {
+            auto write_string = [](const char* string) {
+                (void) !write(STDERR_FILENO, string, strlen(string));
+            };
+
+            write_string(message);
+            write_string(": ");
+            write_string(strerror(error));
+            write_string("\n");
+            _exit(127);
+        };
+
         // first step: close the read end of both pipes
-        close_pipe_fd(stdout_pipe_fds[READ_END_]);
-        close_pipe_fd(stderr_pipe_fds[READ_END_]);
+        ::close(stdout_pipe_fds[READ_END_]);
+        ::close(stderr_pipe_fds[READ_END_]);
 
-        auto connect_fd = [](int fd, int fileno) {
-            for (;;) {
-                if (dup2(fd, fileno) == -1) {
-                    const auto error = errno;
-                    if (error != EINTR) {
-                        throw std::logic_error{"failed to connect pipes: " + std::string(strerror(error))};
-                    }
-                    continue;
+        auto connect_fd = [&fail](int fd, int fileno) {
+            while (dup2(fd, fileno) == -1) {
+                const auto error = errno;
+                if (error != EINTR) {
+                    fail("failed to connect pipes", error);
                 }
-
-                break;
             }
         };
 
@@ -153,32 +178,20 @@ process::process(const std::vector<std::string>& args, const subprocess_env_map_
         connect_fd(stderr_pipe_fds[WRITE_END_], STDERR_FILENO);
 
         // now, we also have to close the write end of both pipes
-        close_pipe_fd(stdout_pipe_fds[WRITE_END_]);
-        close_pipe_fd(stderr_pipe_fds[WRITE_END_]);
-
-        // prepare arguments for exec*
-        auto exec_args = make_args_vector(args);
-        auto exec_env = env_map_to_vector(env);
+        ::close(stdout_pipe_fds[WRITE_END_]);
+        ::close(stderr_pipe_fds[WRITE_END_]);
 
         // call subprocess
-        execvpe(args.front().c_str(), exec_args.data(), exec_env.data());
+        execvpe(exec_args.front(), exec_args.data(), exec_env.data());
 
         // only reached if exec* fails
-
-        // clean up memory if exec should ever return
-        // prevents memleaks if the exception below would be handled by a caller
-        auto deleter = [](char* ptr) {
-            free(ptr);
-            ptr = nullptr;
-        };
-
-        std::for_each(exec_args.begin(), exec_args.end(), deleter);
-        std::for_each(exec_env.begin(), exec_env.end(), deleter);
-
-        throw std::runtime_error{"exec() failed: " + std::string(strerror(errno))};
+        fail("exec() failed", errno);
     }
 
     // parent code
+
+    // the child has its own copy
+    free_exec_vectors();
 
     // we do not intend to write to these pipes from this end
     close_pipe_fd(stdout_pipe_fds[WRITE_END_]);
