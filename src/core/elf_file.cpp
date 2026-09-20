@@ -4,6 +4,7 @@
 #include <fstream>
 #include <memory>
 #include <regex>
+#include <sstream>
 #include <sys/mman.h>
 #include <utility>
 
@@ -189,8 +190,9 @@ namespace linuxdeploy {
 
                 // for now, we use the same ldd based method linuxdeployqt uses
 
-                // of course, it makes no sense to call this method on statically linked binaries
-                assert(isDynamicallyLinked());
+                // Static ELF files have no dynamic dependencies and need no loader probe.
+                if (!isDynamicallyLinked())
+                    return {};
 
                 std::vector<fs::path> paths;
 
@@ -213,12 +215,77 @@ namespace linuxdeploy {
                         return {};
                     }
 
-                    throw std::runtime_error{"Failed to run ldd: exited with code " + std::to_string(result.exit_code())};
+                    // musl reports missing DT_NEEDED libraries on stderr and
+                    // returns a non-zero status, while still printing the
+                    // dependencies it could resolve on stdout.
+                    //
+                    // Accept excluded missing libraries and their possible
+                    // relocation fallout, but reject all other failures.
+                    static const std::regex muslMissingLibraryExpr(
+                        R"(^Error loading shared library ([^:]+): .*$)");
+                    static const std::regex muslMissingSymbolExpr(
+                        R"(^Error relocating .+: .+: symbol not found$)");
+
+                    bool sawExcludedMissingLibrary = false;
+                    bool sawMissingSymbolExpr = false;
+                    bool sawUnexpectedError = false;
+
+                    for (auto& line : util::splitLines(result.stderr_string())) {
+                        util::trim(line);
+
+                        if (line.empty())
+                            continue;
+
+                        std::smatch match;
+                        if (std::regex_match(line, match, muslMissingLibraryExpr)) {
+                            auto missingLibrary = match[1].str();
+                            util::trim(missingLibrary);
+
+                            if (!util::isInExcludelist(missingLibrary, excludeLibraryPatterns)) {
+                                throw DependencyNotFoundError("Could not find dependency: " + missingLibrary);
+                            }
+
+                            sawExcludedMissingLibrary = true;
+                            ldLog() << LD_WARNING
+                                    << resolvedPath.string()
+                                    << "depends on excluded library:"
+                                    << missingLibrary << std::endl;
+
+                            continue;
+                        }
+
+                        if (std::regex_match(line, muslMissingSymbolExpr)) {
+                            sawMissingSymbolExpr = true;
+                        } else {
+                            sawUnexpectedError = true;
+                        }
+                    }
+
+                    // A nonzero exit without an excluded missing library is
+                    // still a failure, even if stderr is empty. Check after
+                    // scanning so diagnostic order does not affect the result.
+                    if (!sawExcludedMissingLibrary || sawUnexpectedError) {
+                        std::ostringstream message;
+                        message << "Failed to run ldd on " << resolvedPath.string()
+                                << ": exited with code " << result.exit_code();
+                        if (!result.stdout_string().empty())
+                            message << "\nstdout:\n" << result.stdout_string();
+                        if (!result.stderr_string().empty())
+                            message << "\nstderr:\n" << result.stderr_string();
+                        throw DependencyTraceError(message.str());
+                    }
+
+                    // Missing symbol may be unrelated to an excluded missing library
+                    if (sawMissingSymbolExpr) {
+                        ldLog() << LD_WARNING
+                        << resolvedPath.string()
+                        << ": ignoring relocation error after an excluded dependency "
+                        "was missing, but the error may be unrelated"
+                        << std::endl;
+                    }
                 }
 
                 const std::regex expr(R"(\s*(.+)\s+\=>\s+(.+)\s+\((.+)\)\s*)");
-                std::smatch what;
-
                 auto lddLines = util::splitLines(result.stdout_string());
 
                 // filter known-problematic, known-unneeded lines
@@ -235,10 +302,33 @@ namespace linuxdeploy {
                     lddLines.end()
                 );
 
+                // These names are aliases for musl's combined libc/dynamic loader.
+                const std::regex muslLibcExpr(R"(lib(c|c_musl|crypt|pthread|resolv|rt|m|dl|util|xnet)\..+)");
+
+                std::smatch what;
                 for (const auto& line : lddLines) {
                     if (std::regex_search(line, what, expr)) {
+                        auto libraryName = what[1].str();
+                        util::trim(libraryName);
                         auto libraryPath = what[2].str();
                         util::trim(libraryPath);
+
+                        const auto fileName = fs::path(libraryPath).filename().string();
+                        const bool muslLoader = util::stringStartsWith(fileName, "ld-musl-")
+                                                && util::stringEndsWith(fileName, ".so.1");
+                        // When a shared object has no PT_INTERP, musl can identify
+                        // itself as argv[0] ("ldd") or by its libc.so filename.
+                        // Neither is an ordinary library to copy into the AppDir.
+                         const bool muslSelfReference = (  fileName == "ldd"
+                                                        || fileName == "libc.so"
+                                                        || fileName == "libc_musl.so")
+                                                        && std::regex_match(libraryName, muslLibcExpr);
+
+                        if (muslLoader || muslSelfReference) {
+                            ldLog() << LD_DEBUG << "skipping musl runtime object" << line << std::endl;
+                            continue;
+                        }
+
                         paths.push_back(fs::absolute(libraryPath));
                     } else {
                         if (util::stringContains(line, "=> not found")) {

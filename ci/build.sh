@@ -2,6 +2,8 @@
 
 set -euxo pipefail
 
+ARCH=${ARCH:-$(uname -m)}
+
 # use RAM disk if possible
 if [ -d /docker-ramdisk ]; then
     TEMP_BASE=/docker-ramdisk

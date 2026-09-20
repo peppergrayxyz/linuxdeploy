@@ -368,7 +368,7 @@ namespace linuxdeploy {
                             for (const auto &dependencyPath : elfFile.traceDynamicDependencies(excludeLibraryPatterns))
                                 if (!deployLibrary(dependencyPath, false, false))
                                     return false;
-                        } catch (const elf_file::DependencyNotFoundError& e) {
+                        } catch (const elf_file::DependencyTraceError& e) {
                             ldLog() << LD_ERROR << e.what() << std::endl;
                             return false;
                         }
@@ -377,7 +377,15 @@ namespace linuxdeploy {
                     }
 
                     static std::string getStripPath() {
-                        // by default, try to use a strip next to the linuxdeploy binary
+                        const auto envStrip = getenv("STRIP");
+
+                        // allows users to use a custom strip instead of the bundled one
+                        if (envStrip != nullptr && *envStrip != '\0') {
+                            ldLog() << LD_DEBUG << "Using strip specified in $STRIP:" << envStrip << std::endl;
+                            return envStrip;
+                        }
+
+                        // try to use a strip next to the linuxdeploy binary
                         // if that isn't available, fall back to searching for strip in the PATH
                         std::string stripPath = "strip";
 

@@ -49,7 +49,7 @@ jobs:
           submodules: recursive
 
       - name: Build
-        run: bash ci/build-in-docker.sh
+        run: bash ci/build-in-docker.sh debian
 
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
@@ -57,6 +57,39 @@ jobs:
         with:
           name: AppImage  ${{ matrix.ARCH }}${{ matrix.USE_STATIC_RUNTIME}}
           path: linuxdeploy*.AppImage*
+
+  dependency-tracing-build-and-test:
+    name: ${{ matrix.target.distro }} / ${{ matrix.target.toolchain }} / ${{ matrix.platform.arch }}
+    runs-on: ${{ matrix.platform.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+        target:
+          - distro: alpine
+            toolchain: musl
+          - distro: alpine
+            toolchain: llvm
+          - distro: gentoo
+            toolchain: llvm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build and test on ${{ matrix.target.distro }}
+        env:
+          ARCH: ${{ matrix.platform.arch }}
+          BUILD_TYPE: dependency-tracing
+          TOOLCHAIN: ${{ matrix.target.toolchain }}
+          UPDATE: 1
+        run: bash ci/build-in-docker.sh ${{ matrix.target.distro }}
 
   freebsd-build-and-test:
     runs-on: ubuntu-latest
