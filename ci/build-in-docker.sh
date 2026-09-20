@@ -18,13 +18,51 @@ error() {
     log_message 1 "[error] $*"
 }
 
-if [[ "$ARCH" == "" ]]; then
-    error "Usage: env ARCH=... bash $0"
-    exit 2
-fi
 set -euo pipefail
 
+ARCH="${ARCH:-$(uname -m)}"
+
 this_dir="$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")"
+
+target="${1:-${TARGET:-debian}}"
+toolchain="${TOOLCHAIN:-}"
+build_args=()
+
+case "$target" in
+    debian)
+        if [[ -n "$toolchain" ]]; then
+            error "TOOLCHAIN is not supported for Debian builds"
+            exit 2
+        fi
+        dockerfile="$this_dir/docker/Dockerfile"
+        ;;
+    alpine)
+        dockerfile="$this_dir/docker/Dockerfile.Alpine"
+        case "$toolchain" in
+            musl|llvm) build_args+=("--target" "$toolchain") ;;
+            *) error "Unsupported Alpine toolchain: $toolchain"
+               exit 2
+            ;;
+        esac
+        ;;
+    gentoo)
+        toolchain="${toolchain:-llvm}"
+        case "$toolchain" in
+            gnu)  gentoo_flavor=latest ;;
+            musl) gentoo_flavor=musl ;;
+            llvm) gentoo_flavor=musl-llvm ;;
+            *) error "Unsupported Gentoo toolchain: $toolchain"
+               exit 2
+            ;;
+        esac
+        build_args+=("--build-arg" "GENTOO_FLAVOR=$gentoo_flavor")
+        dockerfile="$this_dir/docker/Dockerfile.Gentoo"
+        ;;
+    *)
+        error "Unsupported target: $target"
+        exit 2
+        ;;
+esac
 
 case "$ARCH" in
     x86_64)
@@ -48,18 +86,20 @@ esac
 # first, we need to build the image
 # we always attempt to build it, it will only be rebuilt if Docker detects changes
 # optionally, we'll pull the base image beforehand
-info "Building Docker image for $ARCH (Docker platform: $docker_platform)"
-
-build_args=()
+info "Building $target Docker image for $ARCH (Docker platform: $docker_platform)"
 if [[ "${UPDATE:-}" == "" ]]; then
     warning "\$UPDATE not set, base image will not be pulled!"
 else
     build_args+=("--pull")
 fi
 
-image_tag="linuxdeploy-build"
+image_tag="linuxdeploy-build-$target"
+if [[ -n "$toolchain" ]]; then
+    image_tag+="-$toolchain"
+fi
 
 docker build \
+    -f "$dockerfile" \
     --build-arg ARCH="$ARCH" \
     --platform "$docker_platform" \
     "${build_args[@]}" \
@@ -80,11 +120,11 @@ else
     warning "Host system does not have enough free memory -> building on regular disk"
 fi
 
-if [[ "${BUILD_TYPE:-}" == "coverage" ]]; then
-    build_script="ci/test-coverage.sh"
-else
-    build_script="ci/build.sh"
-fi
+case "${BUILD_TYPE:-}" in
+    coverage)           build_script="ci/test-coverage.sh"  ;;
+    dependency-tracing) build_script="ci/test-dependency-tracing.sh" ;;
+    *)                  build_script="ci/build.sh" ;;
+esac
 
 
 if [ -t 1 ]; then
@@ -118,4 +158,4 @@ docker run \
     -v "$(readlink -f "$this_dir"/..):/ws" \
     -w /ws \
     "$image_tag" \
-    bash -xc "$build_script"
+    bash --login -xc "$build_script"

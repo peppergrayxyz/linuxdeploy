@@ -1,0 +1,65 @@
+# Shared dependencies for the Alpine/musl CI builds.
+FROM alpine:3.24 AS base
+
+RUN apk add --no-cache \
+        bash \
+        ca-certificates \
+        cmake \
+        ninja \
+        git \
+        patchelf \
+        pkgconf \
+        file-dev \
+        libpng-dev \
+        libpng-static \
+        libjpeg-turbo-dev \
+        libjpeg-turbo-static \
+        zlib-dev \
+        zlib-static \
+        musl-utils
+
+# CImg is in Alpine's testing repository. Tag it to keep other packages on stable.
+RUN echo '@testing https://dl-cdn.alpinelinux.org/alpine/edge/testing' >> /etc/apk/repositories && \
+    apk add --no-cache cimg@testing
+
+FROM base AS musl
+
+RUN apk add --no-cache build-base gtest-dev
+
+ENV TOOLCHAIN=musl \
+    CC=gcc \
+    CXX=g++ \
+    AR=ar \
+    AS=as \
+    RANLIB=ranlib \
+    OBJCOPY=objcopy \
+    STRIP=strip \
+    CXX_FLAGS="" \
+    LINKER_FLAGS="-fuse-ld=bfd" \
+    CXX_STANDARD_LIBRARIES=""
+
+FROM base AS llvm
+
+# GoogleTest is built from source with libc++ by CMake for this target.
+RUN apk add --no-cache \
+        musl-dev \
+        clang \
+        lld \
+        compiler-rt \
+        libc++-dev \
+        libc++-static \
+        llvm-libunwind-dev \
+        llvm-libunwind-static \
+        llvm
+
+ENV TOOLCHAIN=llvm \
+    CC=clang \
+    CXX=clang++ \
+    AR=llvm-ar \
+    AS=llvm-as \
+    RANLIB=llvm-ranlib \
+    OBJCOPY=llvm-objcopy \
+    STRIP=llvm-strip \
+    CXX_FLAGS="-stdlib=libc++" \
+    LINKER_FLAGS="-fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind" \
+    CXX_STANDARD_LIBRARIES="-lc++abi -lunwind"

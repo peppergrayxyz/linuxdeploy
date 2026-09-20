@@ -16,10 +16,16 @@ namespace linuxdeploy {
                     explicit ElfFileParseError(const std::string& msg) : std::runtime_error(msg) {}
             };
 
-            // thrown by traceDynamicDependencies() if a dependency is missing
-            class DependencyNotFoundError : public std::runtime_error {
+            // thrown when dynamic dependencies cannot be determined
+            class DependencyTraceError : public std::runtime_error {
                 public:
-                    explicit DependencyNotFoundError(const std::string& msg) : std::runtime_error(msg) {}
+                    explicit DependencyTraceError(const std::string& msg) : std::runtime_error(msg) {}
+            };
+
+            // thrown by traceDynamicDependencies() if a dependency is missing
+            class DependencyNotFoundError : public DependencyTraceError {
+                public:
+                    explicit DependencyNotFoundError(const std::string& msg) : DependencyTraceError(msg) {}
             };
 
             class ElfFile {
@@ -44,6 +50,7 @@ namespace linuxdeploy {
                 public:
                     // recursively trace dynamic library dependencies of a given ELF file
                     // this works for both libraries and executables
+                    // static ELF files return an empty vector
                     // the resulting vector consists of absolute paths to the libraries determined by the same methods a system's
                     // linker would use
                     std::vector<std::filesystem::path> traceDynamicDependencies(const std::vector<std::string>& excludeLibraryPatterns={});
