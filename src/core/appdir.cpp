@@ -377,7 +377,18 @@ namespace linuxdeploy {
                     }
 
                     static std::string getStripPath() {
-                        // by default, try to use a strip next to the linuxdeploy binary
+                        const auto envStrip = getenv("STRIP");
+
+                        // allows users to use a custom strip instead of the bundled one
+                        if (envStrip != nullptr && *envStrip != '\0') {
+                            if (!util::which(envStrip).empty()) {
+                                ldLog() << "Using strip specified in $STRIP:" << envStrip << std::endl;
+                                return envStrip;
+                            }
+                            ldLog() << LD_WARNING << "Ignoring $STRIP, could not find program:" << envStrip << std::endl;
+                        }
+
+                        // try to use a strip next to the linuxdeploy binary
                         // if that isn't available, fall back to searching for strip in the PATH
                         std::string stripPath = "strip";
 
